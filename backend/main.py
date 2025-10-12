@@ -12,7 +12,7 @@ app = FastAPI()
 # IMPORTANT: Allow your frontend (running on localhost:3000) to talk to this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://excel-axiom-react-7jqa-dlymztlsc-wasay03s-projects.vercel.app","http://localhost:3000"],
+    allow_origins=["https://excel-axiom-react-n2cejh5ci-wasay03s-projects.vercel.app","http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
