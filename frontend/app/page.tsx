@@ -208,7 +208,7 @@ export default function Home() {
     setHiddenRows(newHiddenRows);
   };
   
-  const getRowId = useCallback((params: GetRowIdParams<RowData>) => params.data.internal_id, []);
+  const getRowId = useCallback((params: GetRowIdParams<RowData>) => String(params.data.internal_id), []);
 
 
   // --- RENDER ---
@@ -315,7 +315,7 @@ export default function Home() {
                       rowSelection="multiple"
                       suppressRowClickSelection={true}
                       onRowSelected={onRowSelected}
-                      getRowNodeId={getRowId}
+                      getRowId={getRowId}
                   />
               </Box>
               <Typography variant="caption" sx={{ mt: 1, flexShrink: 0 }}>
