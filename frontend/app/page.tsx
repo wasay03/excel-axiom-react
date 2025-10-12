@@ -23,7 +23,7 @@ interface ActiveFilterMap {
 }
 
 // --- API Service Functions ---
-const API_URL = 'https://excel-axiom-react-hro4-5a72zyzkw-wasay03s-projects.vercel.app/api';
+const API_URL = 'https://excel-axiom-react-hro4.vercel.app/api';
 
 async function uploadFile(file: File): Promise<any> {
   const formData = new FormData();
