@@ -3,11 +3,12 @@ from typing import Optional, List, Dict, Any
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid
 from collections import OrderedDict
+import httpx
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -56,9 +57,13 @@ class ProcessRequest(BaseModel):
     case_sensitive_search: bool = False
     new_column_config: Optional[Dict[str, Any]] = None
     page: int = 1
-    page_size: int = 500  # Optimized for 75k rows
+    page_size: int = 500
     sort_column: Optional[str] = None
     sort_direction: str = "asc"
+
+class UploadFromUrlRequest(BaseModel):
+    file_url: str
+    filename: str
 
 # --- Helper Functions ---
 
@@ -134,13 +139,11 @@ def read_table_from_bytes(data: bytes, filename: str) -> Optional[pd.DataFrame]:
     try:
         if name.endswith(".csv"):
             try:
-                # Read CSV in chunks for large files
                 return pd.read_csv(buffer, encoding="utf-8-sig", low_memory=False)
             except Exception:
                 buffer.seek(0)
                 return pd.read_csv(buffer, encoding="latin-1", low_memory=False)
         elif name.endswith((".xlsx", ".xls")):
-            # Use openpyxl engine with read_only mode for large files
             return pd.read_excel(buffer, engine='openpyxl')
         else:
             return None
@@ -154,7 +157,6 @@ def apply_search_filter(df: pd.DataFrame, search_term: str, case_sensitive: bool
     
     search_term_processed = search_term if case_sensitive else search_term.lower()
     
-    # Optimize search by only checking string columns
     string_cols = df.select_dtypes(include=[object]).columns
     if len(string_cols) == 0:
         string_cols = df.columns
@@ -169,7 +171,6 @@ def get_sample_for_filters(df: pd.DataFrame, column: str, max_unique: int = 1000
     """For columns with too many unique values, return a sample"""
     unique_values = df[column].dropna().unique()
     if len(unique_values) > max_unique:
-        # For large datasets, sample and sort
         sample = pd.Series(unique_values).sample(n=max_unique, random_state=42).tolist()
         try:
             return sorted(sample)
@@ -181,37 +182,21 @@ def get_sample_for_filters(df: pd.DataFrame, column: str, max_unique: int = 1000
         except TypeError:
             return unique_values.tolist()
 
-# --- API Endpoints ---
-
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    # Check file size (limit to 50MB)
-    contents = await file.read()
-    file_size_mb = len(contents) / (1024 * 1024)
-    
-    if file_size_mb > 50:
-        raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.1f}MB. Maximum is 50MB.")
-    
-    df = read_table_from_bytes(contents, file.filename)
+def process_uploaded_file(data: bytes, filename: str):
+    """Common function to process file data"""
+    df = read_table_from_bytes(data, filename)
 
     if df is None:
         raise HTTPException(status_code=400, detail="Unsupported or invalid file type.")
 
-    # Normalize DataFrame
     df = sanitize_dataframe_for_json(df)
-
-    # Generate session ID
     session_id = str(uuid.uuid4())
-    
-    # Store dataset
     datasets_cache.set(session_id, df)
 
-    # Build filter options (optimized for large datasets)
     column_filters = {}
     for column in df.columns:
         column_filters[column] = get_sample_for_filters(df, column)
     
-    # Calculate basic stats
     total_rows = len(df)
     total_columns = len(df.columns)
     memory_usage_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
@@ -224,21 +209,66 @@ async def upload_file(file: UploadFile = File(...)):
             "total_rows": total_rows,
             "total_columns": total_columns,
             "memory_usage_mb": round(memory_usage_mb, 2),
-            "file_size_mb": round(file_size_mb, 2)
         }
     }
 
+# --- API Endpoints ---
+
+@app.post("/api/upload-url")
+async def upload_from_url(request: UploadFromUrlRequest):
+    """
+    Alternative upload endpoint that accepts a pre-uploaded file URL
+    This bypasses Vercel's 4.5MB limit by having the frontend upload to 
+    Vercel Blob/S3 first, then sending the URL here
+    """
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(request.file_url)
+            response.raise_for_status()
+            file_data = response.content
+        
+        # Check file size
+        file_size_mb = len(file_data) / (1024 * 1024)
+        if file_size_mb > 100:
+            raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.1f}MB. Maximum is 100MB.")
+        
+        result = process_uploaded_file(file_data, request.filename)
+        result["stats"]["file_size_mb"] = round(file_size_mb, 2)
+        return result
+        
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Direct upload endpoint - limited to ~4MB on Vercel serverless
+    For larger files, use /api/upload-url instead
+    """
+    contents = await file.read()
+    file_size_mb = len(contents) / (1024 * 1024)
+    
+    # Vercel serverless function limit
+    if file_size_mb > 4:
+        raise HTTPException(
+            status_code=413, 
+            detail="File too large for direct upload. Please use a smaller file or contact support."
+        )
+    
+    result = process_uploaded_file(contents, file.filename)
+    result["stats"]["file_size_mb"] = round(file_size_mb, 2)
+    return result
+
 @app.post("/api/process")
 async def process_data(request: ProcessRequest):
-    # Retrieve dataset
     df = datasets_cache.get(request.session_id)
     if df is None:
         raise HTTPException(status_code=404, detail="Session expired. Please upload the file again.")
     
-    # Make a working copy
     df = df.copy()
     
-    # Apply new column creation
     if request.new_column_config and request.new_column_config.get("name"):
         config = request.new_column_config
         name = config["name"]
@@ -250,41 +280,30 @@ async def process_data(request: ProcessRequest):
             elif mode == "Expression":
                 df[name] = df.eval(config["expression"])
             
-            # Update cached dataset
             datasets_cache.set(request.session_id, df.copy())
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to add column: {str(e)}")
 
-    # Apply search filter
     filtered_df = apply_search_filter(df, request.search_term, request.case_sensitive_search)
 
-    # Apply column filters
     if request.filters:
         for column_name, selected_values in request.filters.items():
             if selected_values and column_name in filtered_df.columns:
                 filtered_df = filtered_df[filtered_df[column_name].isin(selected_values)]
 
-    # Apply sorting
     if request.sort_column and request.sort_column in filtered_df.columns:
         ascending = request.sort_direction.lower() == "asc"
         filtered_df = filtered_df.sort_values(by=request.sort_column, ascending=ascending)
 
-    # Calculate pagination
     total_rows = len(filtered_df)
     total_pages = max(1, (total_rows + request.page_size - 1) // request.page_size)
-    
-    # Clamp page number
     current_page = max(1, min(request.page, total_pages))
     
-    # Extract page
     start_idx = (current_page - 1) * request.page_size
     end_idx = min(start_idx + request.page_size, total_rows)
     paginated_df = filtered_df.iloc[start_idx:end_idx]
 
-    # Sanitize for JSON
     paginated_df = sanitize_dataframe_for_json(paginated_df)
-    
-    # Convert to dict
     data_dict = paginated_df.to_dict(orient='records')
     cleaned_data = clean_nan_values(data_dict)
 
@@ -318,24 +337,46 @@ async def health_check():
         "active_sessions": datasets_cache.size()
     }
 
-@app.get("/api/export/{session_id}")
-async def export_data(
-    session_id: str,
-    format: str = "csv",
-    filters: Optional[str] = None,
-    search_term: Optional[str] = None
+@app.post("/api/upload-chunk")
+async def upload_chunk(
+    chunk: UploadFile = File(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...),
+    upload_id: str = Form(...)
 ):
-    """Export filtered data (useful for downloading results)"""
-    df = datasets_cache.get(session_id)
-    if df is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+    """
+    Chunked upload endpoint for very large files
+    Frontend splits file into chunks and sends them sequentially
+    """
+    # Store chunks in cache temporarily
+    chunk_key = f"chunk_{upload_id}_{chunk_index}"
+    chunk_data = await chunk.read()
     
-    # Apply filters if provided
-    # (In production, parse filters from query string)
+    # Store chunk
+    datasets_cache.set(chunk_key, chunk_data)
     
-    if format == "csv":
-        output = io.StringIO()
-        df.to_csv(output, index=False)
-        return {"data": output.getvalue(), "filename": f"export_{session_id}.csv"}
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported export format")
+    # If this is the last chunk, reassemble the file
+    if chunk_index == total_chunks - 1:
+        # Reassemble all chunks
+        all_data = bytearray()
+        for i in range(total_chunks):
+            chunk_piece = datasets_cache.get(f"chunk_{upload_id}_{i}")
+            if chunk_piece is None:
+                raise HTTPException(status_code=400, detail=f"Missing chunk {i}")
+            all_data.extend(chunk_piece)
+            # Clean up chunk
+            datasets_cache.delete(f"chunk_{upload_id}_{i}")
+        
+        # Process the complete file
+        file_bytes = bytes(all_data)
+        file_size_mb = len(file_bytes) / (1024 * 1024)
+        
+        if file_size_mb > 100:
+            raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.1f}MB")
+        
+        result = process_uploaded_file(file_bytes, filename)
+        result["stats"]["file_size_mb"] = round(file_size_mb, 2)
+        return result
+    
+    return {"message": f"Chunk {chunk_index + 1}/{total_chunks} uploaded", "complete": False}
