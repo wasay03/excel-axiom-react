@@ -19,7 +19,8 @@ import {
   Collapse,
   SelectChangeEvent,
   Divider,
-  Paper
+  Paper,
+  Pagination
 } from '@mui/material';
 import { AgGridReact } from 'ag-grid-react';
 import { ColDef, GridApi, GridReadyEvent, RowSelectedEvent, GetRowIdParams } from 'ag-grid-community';
@@ -38,6 +39,17 @@ interface ColumnFilterMap {
 
 interface ActiveFilterMap {
   [key: string]: (string | number | boolean)[];
+}
+
+interface PaginationInfo {
+  current_page: number;
+  page_size: number;
+  total_rows: number;
+  total_pages: number;
+  has_next: boolean;
+  has_previous: boolean;
+  showing_from: number;
+  showing_to: number;
 }
 
 // --- API Service Functions ---
@@ -67,10 +79,14 @@ async function processDataAPI(payload: object): Promise<any> {
   return response.json();
 }
 
+async function deleteSession(sessionId: string): Promise<void> {
+  await fetch(`${API_URL}/session/${sessionId}`, { method: 'DELETE' });
+}
+
 // --- Main Page Component ---
 export default function Home() {
   // --- STATE MANAGEMENT ---
-  const [baseData, setBaseData] = useState<RowData[]>([]);
+  const [sessionId, setSessionId] = useState<string>('');
   const [processedData, setProcessedData] = useState<RowData[]>([]);
   const [columns, setColumns] = useState<ColDef[]>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFilterMap>({});
@@ -79,6 +95,10 @@ export default function Home() {
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [hiddenColumns, setHiddenColumns] = useState<string[]>([]);
   const [hiddenRows, setHiddenRows] = useState<Set<number>>(new Set());
+
+  const [pagination, setPagination] = useState<PaginationInfo | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(500);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -92,55 +112,73 @@ export default function Home() {
   const [newColExpression, setNewColExpression] = useState('');
 
   // --- CORE DATA HANDLING ---
-  const processData = useCallback(async (newColumnConfig: object | null = null) => {
-    if (baseData.length === 0) return;
+  const processData = useCallback(async (
+    newColumnConfig: object | null = null,
+    page: number = currentPage,
+    resetPage: boolean = false
+  ) => {
+    if (!sessionId) return;
 
     setLoading(true);
     setError('');
 
-    const dataToProcess = newColumnConfig ? baseData : baseData;
-
     try {
       const payload = {
-        data: dataToProcess.map(({ internal_id, ...rest }) => rest),
+        session_id: sessionId,
         filters: activeFilters,
         search_term: searchTerm,
         case_sensitive_search: caseSensitive,
         new_column_config: newColumnConfig,
+        page: resetPage ? 1 : page,
+        page_size: pageSize,
       };
 
       const result = await processDataAPI(payload);
 
       const dataWithIds = result.data.map((row: object, index: number) => ({
         ...row,
-        internal_id: index,
+        internal_id: (result.pagination.showing_from - 1) + index,
       }));
 
       if (newColumnConfig) {
-        setBaseData(dataWithIds);
-        const newColumns = Object.keys(result.data[0] || {}).map((c) => ({
+        // Update columns when new column is added
+        const newColumns = result.columns.map((c: string) => ({
           headerName: c,
           field: c,
           filter: true,
         }));
-        const currentHideCol = columns.find((c) => c.field === 'hide');
-        setColumns(currentHideCol ? [currentHideCol, ...newColumns] : newColumns);
+        const hideColumn: ColDef = {
+          headerName: 'Hide',
+          field: 'hide',
+          checkboxSelection: true,
+          headerCheckboxSelection: true,
+          width: 80,
+        };
+        setColumns([hideColumn, ...newColumns]);
       }
 
       setProcessedData(dataWithIds);
+      setPagination(result.pagination);
+      
+      if (resetPage) {
+        setCurrentPage(1);
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, [baseData, activeFilters, searchTerm, caseSensitive, columns]);
+  }, [sessionId, activeFilters, searchTerm, caseSensitive, currentPage, pageSize]);
 
+  // Debounced search and filter
   useEffect(() => {
+    if (!sessionId) return;
+    
     if (debounceTimeoutRef.current) clearTimeout(debounceTimeoutRef.current);
     debounceTimeoutRef.current = setTimeout(() => {
-      processData();
+      processData(null, 1, true); // Reset to page 1 when filters change
     }, 500);
-  }, [searchTerm, caseSensitive, activeFilters, processData]);
+  }, [searchTerm, caseSensitive, activeFilters, sessionId]);
 
   // --- EVENT HANDLERS ---
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -149,16 +187,28 @@ export default function Home() {
 
     setLoading(true);
     setError('');
+    
+    // Cleanup old session
+    if (sessionId) {
+      try {
+        await deleteSession(sessionId);
+      } catch (e) {
+        console.warn('Failed to delete old session:', e);
+      }
+    }
+
     try {
       const result = await uploadFile(file);
-      const dataWithIds = result.data.map((row: object, index: number) => ({
-        ...row,
-        internal_id: index,
-      }));
+      
+      setSessionId(result.session_id);
+      setColumnFilters(result.column_filters);
+      setActiveFilters({});
+      setSearchTerm('');
+      setHiddenColumns([]);
+      setHiddenRows(new Set());
+      setCurrentPage(1);
 
-      setBaseData(dataWithIds);
-      setProcessedData(dataWithIds);
-
+      // Set up columns
       const hideColumn: ColDef = {
         headerName: 'Hide',
         field: 'hide',
@@ -171,13 +221,26 @@ export default function Home() {
         field: c,
         filter: true,
       }));
-
       setColumns([hideColumn, ...dataColumns]);
-      setColumnFilters(result.column_filters);
-      setActiveFilters({});
-      setSearchTerm('');
-      setHiddenColumns([]);
-      setHiddenRows(new Set());
+
+      // Fetch first page of data
+      const processPayload = {
+        session_id: result.session_id,
+        filters: {},
+        search_term: '',
+        case_sensitive_search: false,
+        page: 1,
+        page_size: pageSize,
+      };
+      
+      const processResult = await processDataAPI(processPayload);
+      const dataWithIds = processResult.data.map((row: object, index: number) => ({
+        ...row,
+        internal_id: index,
+      }));
+      
+      setProcessedData(dataWithIds);
+      setPagination(processResult.pagination);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -210,10 +273,19 @@ export default function Home() {
       value: newColConstValue,
       expression: newColExpression,
     };
-    processData(config);
+    processData(config, currentPage);
     setNewColName('');
     setNewColConstValue('');
     setNewColExpression('');
+  };
+
+  const handlePageChange = (_event: React.ChangeEvent<unknown>, page: number) => {
+    setCurrentPage(page);
+    processData(null, page);
+    // Scroll to top of grid
+    if (gridApi) {
+      gridApi.ensureIndexVisible(0);
+    }
   };
 
   const onGridReady = (params: GridReadyEvent) => setGridApi(params.api);
@@ -239,6 +311,15 @@ export default function Home() {
   };
 
   const getRowId = useCallback((params: GetRowIdParams<RowData>) => String(params.data.internal_id), []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (sessionId) {
+        deleteSession(sessionId).catch(console.warn);
+      }
+    };
+  }, [sessionId]);
 
   // --- RENDER ---
   return (
@@ -270,7 +351,7 @@ export default function Home() {
             '&:hover': { bgcolor: '#e8f0fe' },
           }}
         >
-          {loading && !baseData.length ? (
+          {loading && !sessionId ? (
             <CircularProgress size={24} color="inherit" />
           ) : (
             'Upload File'
@@ -368,7 +449,7 @@ export default function Home() {
             </Alert>
           )}
 
-          {baseData.length === 0 ? (
+          {!sessionId ? (
             <Box
               sx={{
                 display: 'flex',
@@ -510,10 +591,25 @@ export default function Home() {
                 />
               </Paper>
 
-              <Typography variant="caption" sx={{ mt: 1, flexShrink: 0, color: '#444' }}>
-                Showing {(processedData.length - hiddenRows.size).toLocaleString()} of{' '}
-                {baseData.length.toLocaleString()} rows
-              </Typography>
+              {pagination && (
+                <Box sx={{ mt: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Typography variant="caption" sx={{ color: '#444' }}>
+                    Showing {pagination.showing_from.toLocaleString()} - {pagination.showing_to.toLocaleString()} of{' '}
+                    {pagination.total_rows.toLocaleString()} rows
+                    {hiddenRows.size > 0 && ` (${hiddenRows.size} hidden)`}
+                  </Typography>
+                  
+                  <Pagination
+                    count={pagination.total_pages}
+                    page={currentPage}
+                    onChange={handlePageChange}
+                    color="primary"
+                    showFirstButton
+                    showLastButton
+                    disabled={loading}
+                  />
+                </Box>
+              )}
             </>
           )}
         </Box>
