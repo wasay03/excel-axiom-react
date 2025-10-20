@@ -54,16 +54,60 @@ interface PaginationInfo {
 
 // --- API Service Functions ---
 const API_URL = 'https://excel-axiom-react-hro4.vercel.app/api';
-
-async function uploadFile(file: File): Promise<any> {
-  const formData = new FormData();
-  formData.append('file', file);
-  const response = await fetch(`${API_URL}/upload`, { method: 'POST', body: formData });
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'File upload failed. Unsupported or invalid file type.');
+// const API_URL = 'http://localhost:8000/api';
+async function uploadFile(file: File, onProgress?: (progress: number) => void): Promise<any> {
+  const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB chunks (under Vercel's 4.5MB limit)
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  
+  // For small files, use direct upload
+  if (file.size < 4 * 1024 * 1024) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await fetch(`${API_URL}/upload`, { method: 'POST', body: formData });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'File upload failed.');
+    }
+    return response.json();
   }
-  return response.json();
+  
+  // For large files, use chunked upload
+  const uploadId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const chunk = file.slice(start, end);
+    
+    const formData = new FormData();
+    formData.append('chunk', chunk);
+    formData.append('chunk_index', i.toString());
+    formData.append('total_chunks', totalChunks.toString());
+    formData.append('filename', file.name);
+    formData.append('upload_id', uploadId);
+    
+    const response = await fetch(`${API_URL}/upload-chunk`, { 
+      method: 'POST', 
+      body: formData 
+    });
+    
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Chunk upload failed.');
+    }
+    
+    // Update progress
+    if (onProgress) {
+      onProgress(Math.round(((i + 1) / totalChunks) * 100));
+    }
+    
+    // If this was the last chunk, return the result
+    if (i === totalChunks - 1) {
+      return response.json();
+    }
+  }
+  
+  throw new Error('Upload failed unexpectedly');
 }
 
 async function processDataAPI(payload: object): Promise<any> {
@@ -101,6 +145,7 @@ export default function Home() {
   const [pageSize, setPageSize] = useState(500);
 
   const [loading, setLoading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [error, setError] = useState('');
   const [gridApi, setGridApi] = useState<GridApi | null>(null);
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -187,6 +232,7 @@ export default function Home() {
 
     setLoading(true);
     setError('');
+    setUploadProgress(0);
     
     // Cleanup old session
     if (sessionId) {
@@ -198,7 +244,9 @@ export default function Home() {
     }
 
     try {
-      const result = await uploadFile(file);
+      const result = await uploadFile(file, (progress) => {
+        setUploadProgress(progress);
+      });
       
       setSessionId(result.session_id);
       setColumnFilters(result.column_filters);
@@ -245,6 +293,7 @@ export default function Home() {
       setError(err.message);
     } finally {
       setLoading(false);
+      setUploadProgress(0);
       event.target.value = '';
     }
   };
@@ -352,7 +401,10 @@ export default function Home() {
           }}
         >
           {loading && !sessionId ? (
-            <CircularProgress size={24} color="inherit" />
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <CircularProgress size={24} color="inherit" />
+              {uploadProgress > 0 && <Typography variant="caption">{uploadProgress}%</Typography>}
+            </Box>
           ) : (
             'Upload File'
           )}
