@@ -387,7 +387,7 @@ export default function Home() {
         }}
       >
         <Typography variant="h5" fontWeight="bold">
-          Excel Axiom
+          GEDAT : Gomalian Exome Data Analysis Tool
         </Typography>
         <Button
           variant="contained"
